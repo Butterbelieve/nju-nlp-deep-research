@@ -1,0 +1,53 @@
+# Claude Code 相关
+.claude/
+
+# CodeGraph 索引
+.codegraph/
+
+# IDE 配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# HTML 说明文件（本地查看用，不需要推到 GitHub）
+*.html
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 虚拟环境
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+
+# 数据和索引（语料库和 BM25 索引太大，云上单独处理）
+*.db
+*.db-shm
+*.db-wal
+browsecomp-plus-corpus/
+
+# 模型文件（模型单独 clone）
+Qwen3-8B/
+openPangu-Embedded-7B-DeepDiver/
+
+# 评估结果和提交文件
+runs/
+submission*.jsonl
+eval_results*.jsonl
+
+# 其他临时文件
+*.log
