@@ -1,5 +1,5 @@
 """
-Deep Research Agent — 基于 ReAct 模式的多轮检索问答 Agent.
+Deep Research Agent — ReAct-based multi-round retrieval QA Agent.
 
 Thought -> Action (tool call) -> Observation (tool result) -> Thought -> ... -> Final Answer
 
@@ -43,9 +43,10 @@ BM25 is a keyword-based search engine. It matches the words in your query agains
 
 ## Rules
 - You MUST call search at least once before answering. NEVER answer without searching.
-- Each search must use different keywords — do not repeat the same query.
+- Each search must use DIFFERENT keywords — do not repeat or slightly rephrase the same query.
 - If results are irrelevant, change your keywords instead of giving up.
 - Focus on finding EXACT facts (names, dates, numbers, titles), not vague descriptions.
+- You MUST provide your best guess even if you are not fully certain. NEVER say "cannot be determined" or "information not available". Use whatever evidence you found to make your best educated guess.
 
 ## Output Format
 When you have enough evidence, output your final answer in EXACTLY this format:
@@ -53,6 +54,20 @@ Explanation: <brief explanation citing the evidence you found>
 Exact Answer: <your precise answer>
 
 While searching, write your reasoning and call tools. Do NOT output the final answer format until you have sufficient evidence."""
+
+# Prompt for forcing final answer when stalemate or max rounds reached
+FORCE_ANSWER_PROMPT = (
+    "You must now provide your final answer based on ALL the evidence you have gathered. "
+    "You MUST give your best guess — do NOT say 'cannot be determined' or 'information not available'. "
+    "Use the format:\nExplanation: <your reasoning based on evidence>\nExact Answer: <your best guess>"
+)
+
+# Prompt injected when model repeats a similar query
+REPHRASE_PROMPT = (
+    "You already searched for very similar keywords and did not find useful results. "
+    "You MUST try completely different keywords now — use synonyms, search for a different entity, "
+    "or approach the question from a completely different angle."
+)
 
 
 # ── 上下文管理 ──────────────────────────────────────────────────
@@ -72,6 +87,41 @@ def _extract_rounds(messages: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]
     if current:
         rounds.append(current)
     return rounds
+
+
+def _extract_previous_search_queries(messages: List[Dict[str, Any]]) -> List[str]:
+    """Extract all search queries from previous rounds."""
+    queries = []
+    for msg in messages:
+        if msg["role"] == "assistant" and msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                func = tc.get("function", {})
+                name = func.get("name", "")
+                if name == "search":
+                    args_str = func.get("arguments", "{}")
+                    try:
+                        args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                    except json.JSONDecodeError:
+                        args = {}
+                    q = args.get("query", "")
+                    if q:
+                        queries.append(q.lower().strip())
+    return queries
+
+
+def _is_similar_query(new_query: str, previous_queries: List[str], threshold: float = 0.7) -> bool:
+    """Check if new_query is too similar to any previous query (word overlap ratio)."""
+    new_words = set(new_query.lower().split())
+    if not new_words:
+        return False
+    for prev in previous_queries:
+        prev_words = set(prev.lower().split())
+        if not prev_words:
+            continue
+        overlap = len(new_words & prev_words) / max(len(new_words), len(prev_words))
+        if overlap > threshold:
+            return True
+    return False
 
 
 def _summarize_round(round_msgs: List[Dict[str, Any]]) -> str:
@@ -220,7 +270,7 @@ class DeepResearchAgent:
     def _check_stalemate(
         self,
         messages: List[Dict[str, Any]],
-        stale_threshold: int = 2,
+        stale_threshold: int = 3,
     ) -> bool:
         """Check if the last N rounds found no new documents (information saturation)."""
         rounds = _extract_rounds(messages[2:])
@@ -244,18 +294,42 @@ class DeepResearchAgent:
 
         return len(all_docids) == 0
 
+    def _check_repeated_query(self, messages: List[Dict[str, Any]]) -> bool:
+        """Check if the most recent search query is too similar to a previous one."""
+        previous_queries = _extract_previous_search_queries(messages)
+        if len(previous_queries) < 2:
+            return False
+        latest = previous_queries[-1]
+        earlier = previous_queries[:-1]
+        return _is_similar_query(latest, earlier)
+
     def _extract_final_answer(self, content: str) -> str:
-        """Extract Exact Answer from model output, supporting multiple formats."""
+        """Extract Exact Answer from model output, with format filtering."""
+        # Filter out JSON-like garbage (e.g. leaked tool call format)
+        stripped = content.strip()
+        if stripped.startswith('{"') or stripped.startswith('["'):
+            # Try to find a real answer line within the content
+            for line in content.split("\n"):
+                line = line.strip()
+                if not line or line.startswith("{") or line.startswith("["):
+                    continue
+                if len(line) < 200 and not line.startswith('"'):
+                    return line
+            # If everything is JSON, return empty to signal failure
+            return ""
+
         # Try "Exact Answer: xxx" or "Answer: xxx"
         for prefix in ("exact answer:", "answer:"):
             for line in content.split("\n"):
                 line = line.strip()
                 if line.lower().startswith(prefix):
-                    return line[len(prefix):].strip()
+                    answer = line[len(prefix):].strip()
+                    if answer and not answer.startswith('{"'):
+                        return answer
 
         # Try extracting from the last non-empty line if content looks like a short answer
         lines = [l.strip() for l in content.split("\n") if l.strip()]
-        if lines and len(lines[-1]) < 100:
+        if lines and len(lines[-1]) < 100 and not lines[-1].startswith('{"'):
             return lines[-1]
 
         return content.strip()
@@ -266,7 +340,7 @@ class DeepResearchAgent:
 
         Returns
         -------
-        dict with keys: query, predicted_answer, status, messages
+        dict with keys: predicted_answer, status, messages
         """
         messages = self._build_initial_messages(question)
 
@@ -325,18 +399,17 @@ class DeepResearchAgent:
                     "content": json.dumps(result, ensure_ascii=False),
                 })
 
+            # V3: Check for repeated query and inject rephrase hint
+            if self._check_repeated_query(messages):
+                if verbose:
+                    print(f"  [Round {round_id}] Repeated query detected, injecting rephrase hint")
+                messages.append({"role": "user", "content": REPHRASE_PROMPT})
+
             # Check for stalemate
             if self._check_stalemate(messages):
                 if verbose:
                     print(f"  [Round {round_id}] Stalemate detected, forcing final answer")
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "You have searched multiple times without finding new relevant information. "
-                        "Based on the evidence you have gathered so far, please provide your best answer now. "
-                        "Use the format:\nExplanation: ...\nExact Answer: ..."
-                    ),
-                })
+                messages.append({"role": "user", "content": FORCE_ANSWER_PROMPT})
                 try:
                     response = self.client.simple_chat(
                         model=self.model_name,
@@ -353,14 +426,7 @@ class DeepResearchAgent:
             # Max rounds reached, force answer
             if verbose:
                 print(f"  Max rounds ({self.max_rounds}) reached, forcing final answer")
-            messages.append({
-                "role": "user",
-                "content": (
-                    "You have reached the maximum number of search rounds. "
-                    "Based on the evidence you have gathered, please provide your best answer now. "
-                    "Use the format:\nExplanation: ...\nExact Answer: ..."
-                ),
-            })
+            messages.append({"role": "user", "content": FORCE_ANSWER_PROMPT})
             try:
                 response = self.client.simple_chat(
                     model=self.model_name,
@@ -378,7 +444,8 @@ class DeepResearchAgent:
         for msg in reversed(messages):
             if msg["role"] == "assistant" and msg.get("content"):
                 predicted_answer = self._extract_final_answer(msg["content"])
-                break
+                if predicted_answer:
+                    break
 
         status = "completed" if predicted_answer else "failed"
 
