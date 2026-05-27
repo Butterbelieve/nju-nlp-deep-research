@@ -1,52 +1,41 @@
 """
-Deep Research Agent — ReAct-based multi-round retrieval QA Agent.
+Deep Research Agent V4 — Batch Search + ReAct Deep Dive.
 
-Thought -> Action (tool call) -> Observation (tool result) -> Thought -> ... -> Final Answer
+Phase 1: Programmatic batch search (no LLM) -> broad coverage
+Phase 2: ReAct loop with pre-searched context -> targeted follow-up
 
 """
 
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 from .browsecomp_searcher import BrowseCompBM25Searcher
-from .tools import get_agent_tool_specs_and_registry
+from .query_expander import batch_search, generate_diverse_queries
+from .tools import format_rag_context, get_agent_tool_specs_and_registry
 from .vllm_client import VLLMClient
 
 
 # ── System Prompt ──────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a Deep Research Agent. Your task is to find precise, factual answers to questions by searching through a document collection. You MUST search before answering — never answer from your own knowledge.
+SYSTEM_PROMPT = """You are a Deep Research Agent. Some documents have already been pre-searched for you. Review them carefully first.
 
 ## Available Tools
 - search(query): Search the document collection using BM25 keyword matching. Returns top results with document IDs, scores, and snippets.
 - get_document(docid): Retrieve the full text of a specific document by its ID.
 
 ## CRITICAL: BM25 Search Strategy
-BM25 is a keyword-based search engine. It matches the words in your query against documents. Your search quality depends entirely on choosing the right keywords.
+BM25 is a keyword-based search engine. It matches the words in your query against documents.
 
-- Do NOT search with the full question sentence. Extract the most distinctive keywords and search with those.
-  Example: "A football match between 1990-1994 with a Brazilian referee and 4 yellow cards" -> search "Brazil referee football 1990 1994 yellow card"
-- If search returns no relevant results, try different keywords:
-  - Use synonyms or related terms
-  - Try shorter queries with only the most unique keywords
-  - Try longer queries with more context
-  - Search for specific entities separately (person name, place, date)
-- Search from multiple angles. If searching by person name fails, try searching by event, location, or time period.
-
-## Search Workflow
-1. Analyze the question. Identify key entities: names, dates, locations, events, numbers.
-2. Extract the most distinctive keywords and call search.
-3. If search results contain a relevant document, use get_document to read its full text.
-4. If search results are irrelevant, reformulate your query with different keywords and search again.
-5. Cross-reference information from multiple documents when possible.
-6. Search at least 2 times before giving a final answer.
+- Do NOT search with the full question. Extract the most distinctive keywords and search with those.
+- If pre-searched documents don't contain the answer, search with DIFFERENT keywords.
+- Try synonyms, related terms, or search for specific entities separately.
+- Search from multiple angles.
 
 ## Rules
-- You MUST call search at least once before answering. NEVER answer without searching.
-- Each search must use DIFFERENT keywords — do not repeat or slightly rephrase the same query.
-- If results are irrelevant, change your keywords instead of giving up.
+- Check the pre-searched documents carefully before searching again.
+- Each search must use DIFFERENT keywords — do not repeat queries.
+- You MUST provide your best guess even if uncertain. NEVER say "cannot be determined" or "information not available". Use whatever evidence you found to make your best educated guess.
 - Focus on finding EXACT facts (names, dates, numbers, titles), not vague descriptions.
-- You MUST provide your best guess even if you are not fully certain. NEVER say "cannot be determined" or "information not available". Use whatever evidence you found to make your best educated guess.
 
 ## Output Format
 When you have enough evidence, output your final answer in EXACTLY this format:
@@ -55,14 +44,12 @@ Exact Answer: <your precise answer>
 
 While searching, write your reasoning and call tools. Do NOT output the final answer format until you have sufficient evidence."""
 
-# Prompt for forcing final answer when stalemate or max rounds reached
 FORCE_ANSWER_PROMPT = (
     "You must now provide your final answer based on ALL the evidence you have gathered. "
     "You MUST give your best guess — do NOT say 'cannot be determined' or 'information not available'. "
     "Use the format:\nExplanation: <your reasoning based on evidence>\nExact Answer: <your best guess>"
 )
 
-# Prompt injected when model repeats a similar query
 REPHRASE_PROMPT = (
     "You already searched for very similar keywords and did not find useful results. "
     "You MUST try completely different keywords now — use synonyms, search for a different entity, "
@@ -70,7 +57,7 @@ REPHRASE_PROMPT = (
 )
 
 
-# ── 上下文管理 ──────────────────────────────────────────────────
+# ── Context Management ─────────────────────────────────────────
 
 
 def _extract_rounds(messages: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
@@ -201,7 +188,7 @@ def manage_context(
     return new_messages
 
 
-# ── 工具执行 ────────────────────────────────────────────────────
+# ── Tool Execution ─────────────────────────────────────────────
 
 
 def execute_tool_call(
@@ -228,30 +215,37 @@ def execute_tool_call(
     return result
 
 
-# ── Agent 主类 ──────────────────────────────────────────────────
+# ── Agent ──────────────────────────────────────────────────────
 
 
 class DeepResearchAgent:
-    """ReAct-based multi-round retrieval Deep Research Agent."""
+    """V4: Batch search + ReAct deep dive."""
 
     def __init__(
         self,
         client: VLLMClient,
         searcher: BrowseCompBM25Searcher,
         model_name: str = "qwen_auto",
-        max_rounds: int = 8,
+        max_rounds: int = 5,
         max_tokens: int = 2048,
         search_top_k: int = 10,
         snippet_max_chars: int = 1200,
         max_recent_rounds: int = 4,
         temperature: float = 0.0,
+        presearch_n_queries: int = 5,
+        presearch_top_k: int = 10,
+        presearch_max_docs: int = 30,
     ) -> None:
         self.client = client
+        self.searcher = searcher
         self.model_name = model_name
         self.max_rounds = max_rounds
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.max_recent_rounds = max_recent_rounds
+        self.presearch_n_queries = presearch_n_queries
+        self.presearch_top_k = presearch_top_k
+        self.presearch_max_docs = presearch_max_docs
 
         tool_specs, tool_registry = get_agent_tool_specs_and_registry(
             searcher=searcher,
@@ -261,10 +255,20 @@ class DeepResearchAgent:
         self.tool_specs = tool_specs
         self.tool_registry = tool_registry
 
-    def _build_initial_messages(self, question: str) -> List[Dict[str, Any]]:
+    def _build_initial_messages(
+        self, question: str, presearch_results: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        # Format pre-search results as context
+        evidence = format_rag_context(presearch_results)
+        user_content = (
+            f"Question: {question}\n\n"
+            f"Pre-searched documents (from multiple queries):\n{evidence}\n\n"
+            f"Based on the above documents, either provide your final answer "
+            f"or use tools to search further or read specific documents in full."
+        )
         return [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"{question}\n\nPlease start by searching for relevant information using the search tool. Do NOT answer directly."},
+            {"role": "user", "content": user_content},
         ]
 
     def _check_stalemate(
@@ -272,7 +276,7 @@ class DeepResearchAgent:
         messages: List[Dict[str, Any]],
         stale_threshold: int = 3,
     ) -> bool:
-        """Check if the last N rounds found no new documents (information saturation)."""
+        """Check if the last N rounds found no new documents."""
         rounds = _extract_rounds(messages[2:])
         if len(rounds) < stale_threshold:
             return False
@@ -305,17 +309,15 @@ class DeepResearchAgent:
 
     def _extract_final_answer(self, content: str) -> str:
         """Extract Exact Answer from model output, with format filtering."""
-        # Filter out JSON-like garbage (e.g. leaked tool call format)
         stripped = content.strip()
+        # Filter out JSON-like garbage
         if stripped.startswith('{"') or stripped.startswith('["'):
-            # Try to find a real answer line within the content
             for line in content.split("\n"):
                 line = line.strip()
                 if not line or line.startswith("{") or line.startswith("["):
                     continue
                 if len(line) < 200 and not line.startswith('"'):
                     return line
-            # If everything is JSON, return empty to signal failure
             return ""
 
         # Try "Exact Answer: xxx" or "Answer: xxx"
@@ -327,7 +329,7 @@ class DeepResearchAgent:
                     if answer and not answer.startswith('{"'):
                         return answer
 
-        # Try extracting from the last non-empty line if content looks like a short answer
+        # Try extracting from the last non-empty line
         lines = [l.strip() for l in content.split("\n") if l.strip()]
         if lines and len(lines[-1]) < 100 and not lines[-1].startswith('{"'):
             return lines[-1]
@@ -336,22 +338,35 @@ class DeepResearchAgent:
 
     def run(self, question: str, verbose: bool = True) -> Dict[str, Any]:
         """
-        Run the ReAct loop and return the full trajectory.
+        Run Phase 1 (batch search) + Phase 2 (ReAct deep dive).
 
         Returns
         -------
         dict with keys: predicted_answer, status, messages
         """
-        messages = self._build_initial_messages(question)
+        # ── Phase 1: Batch Search ──────────────────────────────
+        queries = generate_diverse_queries(question, n=self.presearch_n_queries)
+        presearch_results = batch_search(
+            self.searcher, queries,
+            top_k=self.presearch_top_k,
+            max_total=self.presearch_max_docs,
+        )
+
+        if verbose:
+            print(f"  [Pre-search] {len(queries)} queries -> {len(presearch_results)} unique docs")
+            for q in queries:
+                print(f"    Query: {q}")
+
+        # ── Phase 2: ReACT Deep Dive ───────────────────────────
+        messages = self._build_initial_messages(question, presearch_results)
 
         for round_id in range(1, self.max_rounds + 1):
-            # Context management: compress old rounds
+            # Context management
             messages = manage_context(messages, self.max_recent_rounds)
 
-            # Round 1: force tool call to prevent answering without search
-            tool_choice = "required" if round_id == 1 else "auto"
+            # No need to force first-round search — we already have pre-searched docs
+            tool_choice = "auto"
 
-            # Call LLM
             try:
                 response = self.client.simple_chat(
                     model=self.model_name,
@@ -399,7 +414,7 @@ class DeepResearchAgent:
                     "content": json.dumps(result, ensure_ascii=False),
                 })
 
-            # V3: Check for repeated query and inject rephrase hint
+            # Check for repeated query
             if self._check_repeated_query(messages):
                 if verbose:
                     print(f"  [Round {round_id}] Repeated query detected, injecting rephrase hint")
