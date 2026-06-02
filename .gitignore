@@ -15,7 +15,7 @@
 .DS_Store
 Thumbs.db
 
-# HTML 说明文件（本地查看用，不需要推到 GitHub）
+# 说明文件
 *.html
 
 # Python 缓存
@@ -39,10 +39,6 @@ ENV/
 *.db-shm
 *.db-wal
 browsecomp-plus-corpus/
-
-# 模型文件（模型单独 clone）
-Qwen3-8B/
-openPangu-Embedded-7B-DeepDiver/
 
 # 评估结果和提交文件
 runs/

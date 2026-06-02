@@ -71,6 +71,8 @@ git clone https://atomgit.com/ascend-tribe/openPangu-Embedded-7B-DeepDiver.git
 
 ### 4.1 Qwen 路线
 
+git config --global http.version HTTP/1.1
+
 ```bash
 vllm serve ./Qwen3-8B \
   --served-model-name qwen_auto \
