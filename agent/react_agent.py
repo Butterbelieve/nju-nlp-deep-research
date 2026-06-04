@@ -1,8 +1,8 @@
 """
-Deep Research Agent V7 — Forced Multi-Round Search.
+Deep Research Agent V8 — Higher Recall + Fix Empty Answers.
 
 No pre-search. Forces first 3 rounds of search with tool_choice="required".
-Prompt encourages short queries and get_document usage.
+search_top_k=20, snippet_max_chars=1000, max_rounds=12 for better BM25 recall.
 max_tokens=8192 to prevent truncation.
 
 """
@@ -216,17 +216,17 @@ def execute_tool_call(
 
 
 class DeepResearchAgent:
-    """V7: Pure ReAct — forced 3-round search, short queries, mandatory format."""
+    """V8: Pure ReAct — higher recall search, fix empty answers."""
 
     def __init__(
         self,
         client: VLLMClient,
         searcher: BrowseCompBM25Searcher,
         model_name: str = "qwen_auto",
-        max_rounds: int = 8,
+        max_rounds: int = 12,
         max_tokens: int = 8192,
-        search_top_k: int = 10,
-        snippet_max_chars: int = 600,
+        search_top_k: int = 20,
+        snippet_max_chars: int = 1000,
         max_recent_rounds: int = 4,
         temperature: float = 0.0,
     ) -> None:
@@ -466,13 +466,30 @@ class DeepResearchAgent:
             except Exception:
                 pass
 
-        # Extract final answer
+        # Extract final answer — search all assistant messages for content
         predicted_answer = ""
         for msg in reversed(messages):
             if msg["role"] == "assistant" and msg.get("content"):
                 predicted_answer = self._extract_final_answer(msg["content"])
                 if predicted_answer:
                     break
+
+        # If still empty, try extracting from any assistant content with substance
+        if not predicted_answer:
+            for msg in reversed(messages):
+                if msg["role"] == "assistant" and msg.get("content"):
+                    content = msg["content"].strip()
+                    # Strip thinking tags and take the first substantive line
+                    import re
+                    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+                    content = re.sub(r"</?think>", "", content)
+                    for line in content.split("\n"):
+                        line = line.strip()
+                        if line and len(line) > 3 and not line.startswith("Okay") and not line.startswith("Let me"):
+                            predicted_answer = line
+                            break
+                    if predicted_answer:
+                        break
 
         status = "completed" if predicted_answer else "failed"
 
