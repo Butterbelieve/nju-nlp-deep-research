@@ -279,14 +279,49 @@ class DeepResearchAgent:
 
         return len(all_docids) == 0
 
-    def _check_repeated_query(self, messages: List[Dict[str, Any]]) -> bool:
-        """Check if the most recent search query is too similar to a previous one."""
+    def _check_repeated_query_and_stale(
+        self, messages: List[Dict[str, Any]]
+    ) -> bool:
+        """Check if the latest search query is repeated AND returned no new documents."""
         previous_queries = _extract_previous_search_queries(messages)
         if len(previous_queries) < 2:
             return False
         latest = previous_queries[-1]
         earlier = previous_queries[:-1]
-        return _is_similar_query(latest, earlier)
+        if not _is_similar_query(latest, earlier):
+            return False
+
+        # Query is repeated — only flag if the latest search returned no new docids
+        already_seen: set = set()
+        for msg in messages:
+            if msg["role"] == "tool":
+                content = msg.get("content", "")
+                try:
+                    parsed = json.loads(content) if isinstance(content, str) else content
+                    if isinstance(parsed, list):
+                        for item in parsed:
+                            if isinstance(item, dict) and "docid" in item:
+                                already_seen.add(item["docid"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+        # Check the last tool result(s) for new docids
+        latest_docids: set = set()
+        for msg in reversed(messages):
+            if msg["role"] == "tool":
+                content = msg.get("content", "")
+                try:
+                    parsed = json.loads(content) if isinstance(content, str) else content
+                    if isinstance(parsed, list):
+                        for item in parsed:
+                            if isinstance(item, dict) and "docid" in item:
+                                latest_docids.add(item["docid"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                break  # only check the most recent tool result
+
+        new_docs = latest_docids - already_seen
+        return len(new_docs) == 0
 
     def _extract_final_answer(self, content: str) -> str:
         """Extract Exact Answer from model output, with format filtering."""
@@ -391,10 +426,10 @@ class DeepResearchAgent:
                     "content": json.dumps(result, ensure_ascii=False),
                 })
 
-            # Check for repeated query
-            if self._check_repeated_query(messages):
+            # Check for repeated query with no new results
+            if self._check_repeated_query_and_stale(messages):
                 if verbose:
-                    print(f"  [Round {round_id}] Repeated query detected, injecting rephrase hint")
+                    print(f"  [Round {round_id}] Repeated query with no new results, injecting rephrase hint")
                 messages.append({"role": "user", "content": REPHRASE_PROMPT})
 
             # Check for stalemate
