@@ -189,6 +189,8 @@ def manage_context(
 
 _MAX_SEARCH_RESULTS_IN_CONTEXT = 5
 _MAX_GETDOC_CHARS = 2000
+_AUTO_READ_TOP_N = 2  # auto-read top N docs after each search
+_AUTOREAD_DOC_CHARS = 1500  # truncate auto-read docs to this length
 
 
 def _truncate_tool_result(result: Any) -> Any:
@@ -450,6 +452,30 @@ class DeepResearchAgent:
                     "tool_call_id": tool_call["id"],
                     "content": json.dumps(truncated, ensure_ascii=False),
                 })
+
+                # Auto-read top documents from search results for deeper analysis
+                if tool_call["function"]["name"] == "search" and isinstance(result, list):
+                    for doc in result[:_AUTO_READ_TOP_N]:
+                        docid = doc.get("docid")
+                        if not docid:
+                            continue
+                        full_doc = self.tool_registry.get("get_document")
+                        if full_doc:
+                            try:
+                                doc_result = full_doc(docid=docid)
+                                text = doc_result.get("text", "")
+                                if len(text) > _AUTOREAD_DOC_CHARS:
+                                    doc_result["text"] = text[:_AUTOREAD_DOC_CHARS]
+                                # Append as a separate tool result with synthetic ID
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": f"autoread_{docid}",
+                                    "content": json.dumps(doc_result, ensure_ascii=False),
+                                })
+                                if verbose:
+                                    print(f"  [Round {round_id}] Auto-read doc {docid}")
+                            except Exception:
+                                pass
 
             # Check for repeated query with no new results
             if self._check_repeated_query_and_stale(messages):
