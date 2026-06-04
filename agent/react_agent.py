@@ -1,11 +1,9 @@
 """
-Deep Research Agent V5 — Concise Reasoning + Forced Search.
+Deep Research Agent V6 — Pure ReAct.
 
-Phase 1: Programmatic batch search (no LLM) -> broad coverage
-Phase 2: ReAct loop with forced first-round search -> targeted follow-up
-
-V5 key changes: reduced pre-search context, forced tool_choice=required,
-concise prompt, max_tokens=8192 to prevent truncation.
+No pre-search. The model decides what to search for.
+Forces first-round search with tool_choice="required".
+Concise prompt + max_tokens=8192 to prevent truncation.
 
 """
 
@@ -13,23 +11,26 @@ import json
 from typing import Any, Dict, List
 
 from .browsecomp_searcher import BrowseCompBM25Searcher
-from .query_expander import batch_search, generate_diverse_queries
-from .tools import format_rag_context, get_agent_tool_specs_and_registry
+from .tools import get_agent_tool_specs_and_registry
 from .vllm_client import VLLMClient
 
 
 # ── System Prompt ──────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a Deep Research Agent. Pre-searched documents are provided below.
+SYSTEM_PROMPT = """You are a Deep Research Agent. You must search documents to answer the question.
 
 ## Available Tools
 - search(query): BM25 keyword search. Returns top results with doc IDs, scores, and snippets.
 - get_document(docid): Retrieve the full text of a document by its ID.
 
+## Search Strategy
+BM25 matches keywords. Extract the most distinctive keywords from the question and search with those.
+Do NOT search with the full question. Try different keyword combinations if the first search fails.
+
 ## Rules
 - Keep your reasoning BRIEF (1-2 sentences). Do NOT write long analyses.
-- If pre-searched documents contain the answer, give it immediately.
-- If not, search with DIFFERENT keywords. Do NOT search with the full question — extract distinctive keywords only.
+- You MUST search at least once before answering.
+- Search with DIFFERENT keywords each time. Do not repeat queries.
 - You MUST provide your best guess. NEVER say "cannot be determined" or "information not available".
 - Focus on EXACT facts (names, dates, numbers, titles), not vague descriptions.
 
@@ -215,22 +216,19 @@ def execute_tool_call(
 
 
 class DeepResearchAgent:
-    """V5: Concise reasoning + forced search."""
+    """V6: Pure ReAct — no pre-search, forced first search, concise prompt."""
 
     def __init__(
         self,
         client: VLLMClient,
         searcher: BrowseCompBM25Searcher,
         model_name: str = "qwen_auto",
-        max_rounds: int = 5,
+        max_rounds: int = 8,
         max_tokens: int = 8192,
         search_top_k: int = 10,
-        snippet_max_chars: int = 400,
+        snippet_max_chars: int = 600,
         max_recent_rounds: int = 4,
         temperature: float = 0.0,
-        presearch_n_queries: int = 5,
-        presearch_top_k: int = 5,
-        presearch_max_docs: int = 10,
     ) -> None:
         self.client = client
         self.searcher = searcher
@@ -239,9 +237,6 @@ class DeepResearchAgent:
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.max_recent_rounds = max_recent_rounds
-        self.presearch_n_queries = presearch_n_queries
-        self.presearch_top_k = presearch_top_k
-        self.presearch_max_docs = presearch_max_docs
 
         tool_specs, tool_registry = get_agent_tool_specs_and_registry(
             searcher=searcher,
@@ -251,20 +246,10 @@ class DeepResearchAgent:
         self.tool_specs = tool_specs
         self.tool_registry = tool_registry
 
-    def _build_initial_messages(
-        self, question: str, presearch_results: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        # Format pre-search results as context
-        evidence = format_rag_context(presearch_results)
-        user_content = (
-            f"Question: {question}\n\n"
-            f"Pre-searched documents (from multiple queries):\n{evidence}\n\n"
-            f"Based on the above documents, either provide your final answer "
-            f"or use tools to search further or read specific documents in full."
-        )
+    def _build_initial_messages(self, question: str) -> List[Dict[str, Any]]:
         return [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
+            {"role": "user", "content": f"Question: {question}"},
         ]
 
     def _check_stalemate(
@@ -334,33 +319,19 @@ class DeepResearchAgent:
 
     def run(self, question: str, verbose: bool = True) -> Dict[str, Any]:
         """
-        Run Phase 1 (batch search) + Phase 2 (ReAct deep dive).
+        Run pure ReAct loop.
 
         Returns
         -------
         dict with keys: predicted_answer, status, messages
         """
-        # ── Phase 1: Batch Search ──────────────────────────────
-        queries = generate_diverse_queries(question, n=self.presearch_n_queries)
-        presearch_results = batch_search(
-            self.searcher, queries,
-            top_k=self.presearch_top_k,
-            max_total=self.presearch_max_docs,
-        )
-
-        if verbose:
-            print(f"  [Pre-search] {len(queries)} queries -> {len(presearch_results)} unique docs")
-            for q in queries:
-                print(f"    Query: {q}")
-
-        # ── Phase 2: ReACT Deep Dive ───────────────────────────
-        messages = self._build_initial_messages(question, presearch_results)
+        messages = self._build_initial_messages(question)
 
         for round_id in range(1, self.max_rounds + 1):
             # Context management
             messages = manage_context(messages, self.max_recent_rounds)
 
-            # Force first-round search to ensure model explores beyond pre-search
+            # Force first-round search
             if round_id == 1:
                 tool_choice = "required"
             else:
