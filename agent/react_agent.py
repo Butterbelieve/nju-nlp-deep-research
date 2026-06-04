@@ -28,15 +28,16 @@ BM25 matches keywords. Extract the most distinctive keywords from the question a
 Do NOT search with the full question. Try different keyword combinations if the first search fails.
 
 ## Rules
-- Keep your reasoning BRIEF (1-2 sentences). Do NOT write long analyses.
 - You MUST search at least once before answering.
+- Analyze search results carefully. If a snippet mentions relevant information, use get_document to read the full text.
 - Search with DIFFERENT keywords each time. Do not repeat queries.
+- If one search fails, try synonyms, related entities, or a different angle.
 - You MUST provide your best guess. NEVER say "cannot be determined" or "information not available".
 - Focus on EXACT facts (names, dates, numbers, titles), not vague descriptions.
 
 ## Output Format
 When ready, output EXACTLY:
-Explanation: <1-2 sentence reasoning>
+Explanation: <your reasoning based on the evidence found>
 Exact Answer: <your precise answer>
 
 While searching, call tools. Do NOT output the answer format until you have evidence or have exhausted searches."""
