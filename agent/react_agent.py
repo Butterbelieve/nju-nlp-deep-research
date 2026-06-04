@@ -1,10 +1,9 @@
 """
-Deep Research Agent V8 — Higher Recall + Context Overflow Fix.
+Deep Research Agent V9 — Gap-Driven ReAct.
 
-No pre-search. Forces first 3 rounds of search with tool_choice="required".
-search_top_k=20 for better BM25 recall, but tool results are truncated
-to stay within the 40960-token context limit.
-
+Only forces Round 1 search. Rounds 2+ use gap analysis prompts
+to guide the model toward searching for specific missing information.
+No auto-read — the model decides when to call get_document.
 """
 
 import json
@@ -25,10 +24,11 @@ SYSTEM_PROMPT = """You are a Deep Research Agent. You must search documents to a
 - get_document(docid): Retrieve the full text of a document by its ID.
 
 ## Search Strategy
-- Search with SHORT keyword phrases (2-4 words), NOT the full question.
-- When search returns relevant snippets, use get_document to read the full text for more details.
-- If first search fails, try different keywords, synonyms, or search for a specific entity.
-- You MUST search at least 3 times with different keywords before answering.
+- Start by searching for the most distinctive entity or clue in the question.
+- After each search, identify what information you STILL NEED and search for that specific missing piece.
+- Each search should target a SPECIFIC missing clue, not repeat the whole question.
+- Search with SHORT keyword phrases (2-4 words).
+- If a snippet mentions relevant information, use get_document to read the full text.
 
 ## Rules
 - Search with DIFFERENT keywords each time. Do not repeat queries.
@@ -46,6 +46,15 @@ FORCE_ANSWER_PROMPT = (
     "You must now provide your final answer based on ALL the evidence you have gathered. "
     "You MUST give your best guess — do NOT say 'cannot be determined' or 'information not available'. "
     "Use the format:\nExplanation: <your reasoning based on evidence>\nExact Answer: <your best guess>"
+)
+
+GAP_ANALYSIS_PROMPT = (
+    "Review the search results above carefully.\n"
+    "- What specific clues from the question have you found evidence for?\n"
+    "- What information is still missing?\n"
+    "If critical information is missing, search with targeted keywords for the missing piece. "
+    "If a snippet mentions relevant information but is incomplete, use get_document to read the full text.\n"
+    "If you have enough evidence, provide your final answer using the mandatory format."
 )
 
 REPHRASE_PROMPT = (
@@ -190,49 +199,6 @@ def manage_context(
 
 _MAX_SEARCH_RESULTS_IN_CONTEXT = 5
 _MAX_GETDOC_CHARS = 2000
-_AUTO_READ_TOP_N = 2  # auto-read top N docs after each search
-_AUTOREAD_DOC_CHARS = 1500  # truncate auto-read docs to this length
-
-
-def _extract_entities_from_results(messages: List[Dict[str, Any]]) -> List[str]:
-    """Extract key entities (capitalized phrases, dates, proper nouns) from recent tool results."""
-    entities: List[str] = []
-    seen: set = set()
-
-    for msg in reversed(messages):
-        if msg.get("role") != "tool":
-            continue
-        content = msg.get("content", "")
-        # Collect text from tool results
-        texts = []
-        try:
-            parsed = json.loads(content) if isinstance(content, str) else content
-            if isinstance(parsed, list):
-                for item in parsed[:3]:
-                    if isinstance(item, dict):
-                        texts.append(item.get("snippet", "")[:300])
-                        texts.append(item.get("text", "")[:300])
-            elif isinstance(parsed, dict):
-                texts.append(parsed.get("text", "")[:300])
-        except (json.JSONDecodeError, TypeError):
-            texts.append(content[:300])
-
-        for text in texts:
-            # Extract capitalized phrases (names, places, titles)
-            for match in re.findall(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b", text):
-                if match.lower() not in seen and len(match) > 4:
-                    entities.append(match)
-                    seen.add(match.lower())
-            # Extract quoted phrases
-            for match in re.findall(r'"([^"]{3,40})"', text):
-                if match.lower() not in seen:
-                    entities.append(f'"{match}"')
-                    seen.add(match.lower())
-
-        if len(entities) >= 8:
-            break
-
-    return entities[:8]
 
 
 def _truncate_tool_result(result: Any) -> Any:
@@ -284,14 +250,14 @@ def execute_tool_call(
 
 
 class DeepResearchAgent:
-    """V8: Pure ReAct — higher recall search, context overflow fix."""
+    """V9: Gap-driven ReAct — model reasons about missing info before searching."""
 
     def __init__(
         self,
         client: VLLMClient,
         searcher: BrowseCompBM25Searcher,
         model_name: str = "qwen_auto",
-        max_rounds: int = 12,
+        max_rounds: int = 10,
         max_tokens: int = 4096,
         search_top_k: int = 20,
         snippet_max_chars: int = 600,
@@ -429,7 +395,7 @@ class DeepResearchAgent:
 
     def run(self, question: str, verbose: bool = True) -> Dict[str, Any]:
         """
-        Run pure ReAct loop.
+        Run gap-driven ReAct loop.
 
         Returns
         -------
@@ -441,8 +407,8 @@ class DeepResearchAgent:
             # Context management
             messages = manage_context(messages, self.max_recent_rounds)
 
-            # Force first 3 rounds of search to ensure multi-round exploration
-            if round_id <= 3:
+            # Only force search on round 1; later rounds use gap analysis
+            if round_id == 1:
                 tool_choice = "required"
             else:
                 tool_choice = "auto"
@@ -495,47 +461,18 @@ class DeepResearchAgent:
                     "content": json.dumps(truncated, ensure_ascii=False),
                 })
 
-                # Auto-read top documents from search results for deeper analysis
-                if tool_call["function"]["name"] == "search" and isinstance(result, list):
-                    for doc in result[:_AUTO_READ_TOP_N]:
-                        docid = doc.get("docid")
-                        if not docid:
-                            continue
-                        full_doc = self.tool_registry.get("get_document")
-                        if full_doc:
-                            try:
-                                doc_result = full_doc(docid=docid)
-                                text = doc_result.get("text", "")
-                                if len(text) > _AUTOREAD_DOC_CHARS:
-                                    doc_result["text"] = text[:_AUTOREAD_DOC_CHARS]
-                                # Append as a separate tool result with synthetic ID
-                                messages.append({
-                                    "role": "tool",
-                                    "tool_call_id": f"autoread_{docid}",
-                                    "content": json.dumps(doc_result, ensure_ascii=False),
-                                })
-                                if verbose:
-                                    print(f"  [Round {round_id}] Auto-read doc {docid}")
-                            except Exception:
-                                pass
+            # Inject gap analysis prompt after each round with tool results
+            # This forces the model to reason about what's still missing
+            messages.append({"role": "user", "content": GAP_ANALYSIS_PROMPT})
+            if verbose:
+                print(f"  [Round {round_id}] Injected gap analysis prompt")
 
             # Check for repeated query with no new results
             if self._check_repeated_query_and_stale(messages):
                 if verbose:
                     print(f"  [Round {round_id}] Repeated query with no new results, injecting rephrase hint")
-                messages.append({"role": "user", "content": REPHRASE_PROMPT})
-            elif round_id < self.max_rounds and tool_calls:
-                # Inject discovered entities to guide next search round
-                entities = _extract_entities_from_results(messages)
-                if entities:
-                    hint = (
-                        "Key entities found in documents: "
-                        + ", ".join(entities[:6])
-                        + ". Try searching for these specific terms."
-                    )
-                    messages.append({"role": "user", "content": hint})
-                    if verbose:
-                        print(f"  [Round {round_id}] Discovered entities: {', '.join(entities[:6])}")
+                # Replace gap analysis with rephrase prompt
+                messages[-1] = {"role": "user", "content": REPHRASE_PROMPT}
 
             # Check for stalemate
             if self._check_stalemate(messages):
@@ -584,9 +521,7 @@ class DeepResearchAgent:
             for msg in reversed(messages):
                 if msg["role"] == "assistant" and msg.get("content"):
                     content = msg["content"].strip()
-                    # Strip thinking tags and take the first substantive line
-                    import re
-                    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+                    content = re.sub(r"ჵ.*? mówi", "", content, flags=re.DOTALL)
                     content = re.sub(r"</?think>", "", content)
                     for line in content.split("\n"):
                         line = line.strip()
