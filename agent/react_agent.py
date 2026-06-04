@@ -1,8 +1,11 @@
 """
-Deep Research Agent V4 — Batch Search + ReAct Deep Dive.
+Deep Research Agent V5 — Concise Reasoning + Forced Search.
 
 Phase 1: Programmatic batch search (no LLM) -> broad coverage
-Phase 2: ReAct loop with pre-searched context -> targeted follow-up
+Phase 2: ReAct loop with forced first-round search -> targeted follow-up
+
+V5 key changes: reduced pre-search context, forced tool_choice=required,
+concise prompt, max_tokens=8192 to prevent truncation.
 
 """
 
@@ -17,32 +20,25 @@ from .vllm_client import VLLMClient
 
 # ── System Prompt ──────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a Deep Research Agent. Some documents have already been pre-searched for you. Review them carefully first.
+SYSTEM_PROMPT = """You are a Deep Research Agent. Pre-searched documents are provided below.
 
 ## Available Tools
-- search(query): Search the document collection using BM25 keyword matching. Returns top results with document IDs, scores, and snippets.
-- get_document(docid): Retrieve the full text of a specific document by its ID.
-
-## CRITICAL: BM25 Search Strategy
-BM25 is a keyword-based search engine. It matches the words in your query against documents.
-
-- Do NOT search with the full question. Extract the most distinctive keywords and search with those.
-- If pre-searched documents don't contain the answer, search with DIFFERENT keywords.
-- Try synonyms, related terms, or search for specific entities separately.
-- Search from multiple angles.
+- search(query): BM25 keyword search. Returns top results with doc IDs, scores, and snippets.
+- get_document(docid): Retrieve the full text of a document by its ID.
 
 ## Rules
-- Check the pre-searched documents carefully before searching again.
-- Each search must use DIFFERENT keywords — do not repeat queries.
-- You MUST provide your best guess even if uncertain. NEVER say "cannot be determined" or "information not available". Use whatever evidence you found to make your best educated guess.
-- Focus on finding EXACT facts (names, dates, numbers, titles), not vague descriptions.
+- Keep your reasoning BRIEF (1-2 sentences). Do NOT write long analyses.
+- If pre-searched documents contain the answer, give it immediately.
+- If not, search with DIFFERENT keywords. Do NOT search with the full question — extract distinctive keywords only.
+- You MUST provide your best guess. NEVER say "cannot be determined" or "information not available".
+- Focus on EXACT facts (names, dates, numbers, titles), not vague descriptions.
 
 ## Output Format
-When you have enough evidence, output your final answer in EXACTLY this format:
-Explanation: <brief explanation citing the evidence you found>
+When ready, output EXACTLY:
+Explanation: <1-2 sentence reasoning>
 Exact Answer: <your precise answer>
 
-While searching, write your reasoning and call tools. Do NOT output the final answer format until you have sufficient evidence."""
+While searching, call tools. Do NOT output the answer format until you have evidence or have exhausted searches."""
 
 FORCE_ANSWER_PROMPT = (
     "You must now provide your final answer based on ALL the evidence you have gathered. "
@@ -219,7 +215,7 @@ def execute_tool_call(
 
 
 class DeepResearchAgent:
-    """V4: Batch search + ReAct deep dive."""
+    """V5: Concise reasoning + forced search."""
 
     def __init__(
         self,
@@ -227,14 +223,14 @@ class DeepResearchAgent:
         searcher: BrowseCompBM25Searcher,
         model_name: str = "qwen_auto",
         max_rounds: int = 5,
-        max_tokens: int = 2048,
+        max_tokens: int = 8192,
         search_top_k: int = 10,
-        snippet_max_chars: int = 1200,
+        snippet_max_chars: int = 400,
         max_recent_rounds: int = 4,
         temperature: float = 0.0,
         presearch_n_queries: int = 5,
-        presearch_top_k: int = 10,
-        presearch_max_docs: int = 30,
+        presearch_top_k: int = 5,
+        presearch_max_docs: int = 10,
     ) -> None:
         self.client = client
         self.searcher = searcher
@@ -364,8 +360,11 @@ class DeepResearchAgent:
             # Context management
             messages = manage_context(messages, self.max_recent_rounds)
 
-            # No need to force first-round search — we already have pre-searched docs
-            tool_choice = "auto"
+            # Force first-round search to ensure model explores beyond pre-search
+            if round_id == 1:
+                tool_choice = "required"
+            else:
+                tool_choice = "auto"
 
             try:
                 response = self.client.simple_chat(
