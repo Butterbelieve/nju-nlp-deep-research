@@ -1,9 +1,9 @@
 """
-Deep Research Agent V6 — Pure ReAct.
+Deep Research Agent V7 — Forced Multi-Round Search.
 
-No pre-search. The model decides what to search for.
-Forces first-round search with tool_choice="required".
-Concise prompt + max_tokens=8192 to prevent truncation.
+No pre-search. Forces first 3 rounds of search with tool_choice="required".
+Prompt encourages short queries and get_document usage.
+max_tokens=8192 to prevent truncation.
 
 """
 
@@ -24,19 +24,18 @@ SYSTEM_PROMPT = """You are a Deep Research Agent. You must search documents to a
 - get_document(docid): Retrieve the full text of a document by its ID.
 
 ## Search Strategy
-BM25 matches keywords. Extract the most distinctive keywords from the question and search with those.
-Do NOT search with the full question. Try different keyword combinations if the first search fails.
+- Search with SHORT keyword phrases (2-4 words), NOT the full question.
+- When search returns relevant snippets, use get_document to read the full text for more details.
+- If first search fails, try different keywords, synonyms, or search for a specific entity.
+- You MUST search at least 3 times with different keywords before answering.
 
 ## Rules
-- You MUST search at least once before answering.
-- Analyze search results carefully. If a snippet mentions relevant information, use get_document to read the full text.
 - Search with DIFFERENT keywords each time. Do not repeat queries.
-- If one search fails, try synonyms, related entities, or a different angle.
 - You MUST provide your best guess. NEVER say "cannot be determined" or "information not available".
 - Focus on EXACT facts (names, dates, numbers, titles), not vague descriptions.
 
-## Output Format
-When ready, output EXACTLY:
+## Output Format (MANDATORY)
+You MUST end your final response with EXACTLY these two lines:
 Explanation: <your reasoning based on the evidence found>
 Exact Answer: <your precise answer>
 
@@ -217,7 +216,7 @@ def execute_tool_call(
 
 
 class DeepResearchAgent:
-    """V6: Pure ReAct — no pre-search, forced first search, concise prompt."""
+    """V7: Pure ReAct — forced 3-round search, short queries, mandatory format."""
 
     def __init__(
         self,
@@ -314,7 +313,14 @@ class DeepResearchAgent:
         # Try extracting from the last non-empty line
         lines = [l.strip() for l in content.split("\n") if l.strip()]
         if lines and len(lines[-1]) < 100 and not lines[-1].startswith('{"'):
-            return lines[-1]
+            answer = lines[-1]
+            # Filter out "cannot be determined" type answers
+            if any(phrase in answer.lower() for phrase in (
+                "cannot be determined", "not available", "not found",
+                "information cannot", "information is not",
+            )):
+                return ""
+            return answer
 
         return content.strip()
 
@@ -332,8 +338,8 @@ class DeepResearchAgent:
             # Context management
             messages = manage_context(messages, self.max_recent_rounds)
 
-            # Force first-round search
-            if round_id == 1:
+            # Force first 3 rounds of search to ensure multi-round exploration
+            if round_id <= 3:
                 tool_choice = "required"
             else:
                 tool_choice = "auto"
