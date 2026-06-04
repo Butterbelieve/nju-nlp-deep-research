@@ -1,9 +1,9 @@
 """
-Deep Research Agent V8 — Higher Recall + Fix Empty Answers.
+Deep Research Agent V8 — Higher Recall + Context Overflow Fix.
 
 No pre-search. Forces first 3 rounds of search with tool_choice="required".
-search_top_k=20, snippet_max_chars=1000, max_rounds=12 for better BM25 recall.
-max_tokens=8192 to prevent truncation.
+search_top_k=20 for better BM25 recall, but tool results are truncated
+to stay within the 40960-token context limit.
 
 """
 
@@ -187,6 +187,30 @@ def manage_context(
 
 # ── Tool Execution ─────────────────────────────────────────────
 
+_MAX_SEARCH_RESULTS_IN_CONTEXT = 5
+_MAX_GETDOC_CHARS = 2000
+
+
+def _truncate_tool_result(result: Any) -> Any:
+    """Truncate tool results to keep context within token limits."""
+    if isinstance(result, list):
+        # search results: keep top N, strip long snippets
+        truncated = []
+        for item in result[:_MAX_SEARCH_RESULTS_IN_CONTEXT]:
+            if isinstance(item, dict):
+                item = dict(item)
+                if "snippet" in item and len(item["snippet"]) > 400:
+                    item["snippet"] = item["snippet"][:400]
+                truncated.append(item)
+        return truncated
+    if isinstance(result, dict) and "text" in result:
+        # get_document: truncate full text
+        truncated = dict(result)
+        if len(truncated["text"]) > _MAX_GETDOC_CHARS:
+            truncated["text"] = truncated["text"][:_MAX_GETDOC_CHARS]
+        return truncated
+    return result
+
 
 def execute_tool_call(
     tool_call: Dict[str, Any],
@@ -216,7 +240,7 @@ def execute_tool_call(
 
 
 class DeepResearchAgent:
-    """V8: Pure ReAct — higher recall search, fix empty answers."""
+    """V8: Pure ReAct — higher recall search, context overflow fix."""
 
     def __init__(
         self,
@@ -224,10 +248,10 @@ class DeepResearchAgent:
         searcher: BrowseCompBM25Searcher,
         model_name: str = "qwen_auto",
         max_rounds: int = 12,
-        max_tokens: int = 8192,
+        max_tokens: int = 4096,
         search_top_k: int = 20,
-        snippet_max_chars: int = 1000,
-        max_recent_rounds: int = 4,
+        snippet_max_chars: int = 600,
+        max_recent_rounds: int = 3,
         temperature: float = 0.0,
     ) -> None:
         self.client = client
@@ -417,13 +441,14 @@ class DeepResearchAgent:
             if not tool_calls:
                 break
 
-            # Execute tool calls
+            # Execute tool calls and truncate results to prevent context overflow
             for tool_call in tool_calls:
                 result = execute_tool_call(tool_call, self.tool_registry)
+                truncated = _truncate_tool_result(result)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call["id"],
-                    "content": json.dumps(result, ensure_ascii=False),
+                    "content": json.dumps(truncated, ensure_ascii=False),
                 })
 
             # Check for repeated query with no new results
