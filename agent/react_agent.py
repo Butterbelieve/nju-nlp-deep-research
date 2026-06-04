@@ -1,9 +1,9 @@
 """
-Deep Research Agent V9 — Gap-Driven ReAct.
+Deep Research Agent V10 — Auto Deep-Read + LLM Summarization.
 
-Only forces Round 1 search. Rounds 2+ use gap analysis prompts
-to guide the model toward searching for specific missing information.
-No auto-read — the model decides when to call get_document.
+Round 1 forced search, Rounds 2-3 gap analysis, then auto deep-read
+top docs + LLM summary injected into context. Rounds 4+ continue
+with gap analysis. Forces answer on stalemate or max rounds.
 """
 
 import json
@@ -61,6 +61,12 @@ REPHRASE_PROMPT = (
     "You already searched for very similar keywords and did not find useful results. "
     "You MUST try completely different keywords now — use synonyms, search for a different entity, "
     "or approach the question from a completely different angle."
+)
+
+DEEP_READ_SUMMARY_SYSTEM = (
+    "You are analyzing documents to find information relevant to a question. "
+    "Extract ONLY the specific facts, names, dates, numbers, and details that are "
+    "directly relevant to answering the question. Ignore irrelevant content."
 )
 
 
@@ -250,7 +256,7 @@ def execute_tool_call(
 
 
 class DeepResearchAgent:
-    """V9: Gap-driven ReAct — model reasons about missing info before searching."""
+    """V10: Auto deep-read + LLM summarization after Round 3."""
 
     def __init__(
         self,
@@ -263,6 +269,9 @@ class DeepResearchAgent:
         snippet_max_chars: int = 600,
         max_recent_rounds: int = 3,
         temperature: float = 0.0,
+        deep_read_after_round: int = 3,
+        deep_read_top_n: int = 5,
+        deep_read_doc_max_chars: int = 3000,
     ) -> None:
         self.client = client
         self.searcher = searcher
@@ -271,6 +280,9 @@ class DeepResearchAgent:
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.max_recent_rounds = max_recent_rounds
+        self.deep_read_after_round = deep_read_after_round
+        self.deep_read_top_n = deep_read_top_n
+        self.deep_read_doc_max_chars = deep_read_doc_max_chars
 
         tool_specs, tool_registry = get_agent_tool_specs_and_registry(
             searcher=searcher,
@@ -356,6 +368,110 @@ class DeepResearchAgent:
 
         new_docs = latest_docids - already_seen
         return len(new_docs) == 0
+
+    def _collect_top_docids(
+        self, messages: List[Dict[str, Any]], top_n: int,
+    ) -> List[tuple[str, float]]:
+        """Collect top-N unique (docid, score) pairs from all search results in messages."""
+        doc_scores: dict[str, float] = {}
+        for msg in messages:
+            if msg["role"] != "tool":
+                continue
+            content = msg.get("content", "")
+            try:
+                parsed = json.loads(content) if isinstance(content, str) else content
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(parsed, list):
+                continue
+            for item in parsed:
+                if not isinstance(item, dict):
+                    continue
+                docid = item.get("docid")
+                score = item.get("score", 0.0)
+                if docid and (docid not in doc_scores or score > doc_scores[docid]):
+                    doc_scores[docid] = score
+        sorted_docs = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)
+        return sorted_docs[:top_n]
+
+    def _run_deep_read(
+        self,
+        question: str,
+        messages: List[Dict[str, Any]],
+        verbose: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Auto deep-read top docs and inject LLM summary into context."""
+        top_docs = self._collect_top_docids(messages, self.deep_read_top_n)
+        if not top_docs:
+            if verbose:
+                print("  [Deep-Read] No documents found to read")
+            return messages
+
+        if verbose:
+            docids_str = ", ".join(d[0] for d in top_docs)
+            print(f"  [Deep-Read] Reading docs: {docids_str}")
+
+        # Fetch full text for each doc
+        doc_texts: list[str] = []
+        for docid, score in top_docs:
+            try:
+                result = self.tool_registry["get_document"](docid=docid)
+                text = result.get("text", "") if isinstance(result, dict) else str(result)
+                if len(text) > self.deep_read_doc_max_chars:
+                    text = text[: self.deep_read_doc_max_chars]
+                doc_texts.append(f"[Document: {docid} (score: {score:.2f})]\n{text}")
+            except Exception as e:
+                if verbose:
+                    print(f"  [Deep-Read] Failed to read {docid}: {e}")
+
+        if not doc_texts:
+            return messages
+
+        # LLM summarization
+        docs_block = "\n---\n".join(doc_texts)
+        summary_messages = [
+            {"role": "system", "content": DEEP_READ_SUMMARY_SYSTEM},
+            {
+                "role": "user",
+                "content": f"Question: {question}\n\nDocuments:\n{docs_block}\n\nExtract all information relevant to the question.",
+            },
+        ]
+
+        try:
+            response = self.client.simple_chat(
+                model=self.model_name,
+                messages=summary_messages,
+                temperature=0.0,
+                max_tokens=1024,
+                extra_payload={
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
+            )
+            summary_text = response["choices"][0]["message"].get("content", "")
+        except Exception as e:
+            if verbose:
+                print(f"  [Deep-Read] LLM summarization failed: {e}")
+            return messages
+
+        if not summary_text.strip():
+            return messages
+
+        # Inject summary as user message
+        analysis_msg = {
+            "role": "user",
+            "content": (
+                f"[Document Analysis - Key findings from top documents]:\n"
+                f"{summary_text}\n\n"
+                "Continue searching if needed, or provide your final answer based on this analysis."
+            ),
+        }
+        messages.append(analysis_msg)
+
+        if verbose:
+            preview = summary_text[:120].replace("\n", " ")
+            print(f"  [Deep-Read] Summary injected: {preview}...")
+
+        return messages
 
     def _extract_final_answer(self, content: str) -> str:
         """Extract Exact Answer from model output, with format filtering."""
@@ -461,18 +577,21 @@ class DeepResearchAgent:
                     "content": json.dumps(truncated, ensure_ascii=False),
                 })
 
-            # Inject gap analysis prompt after each round with tool results
-            # This forces the model to reason about what's still missing
-            messages.append({"role": "user", "content": GAP_ANALYSIS_PROMPT})
-            if verbose:
-                print(f"  [Round {round_id}] Injected gap analysis prompt")
-
             # Check for repeated query with no new results
             if self._check_repeated_query_and_stale(messages):
                 if verbose:
                     print(f"  [Round {round_id}] Repeated query with no new results, injecting rephrase hint")
-                # Replace gap analysis with rephrase prompt
-                messages[-1] = {"role": "user", "content": REPHRASE_PROMPT}
+                # Replace gap analysis with rephrase prompt (gap analysis not yet injected)
+                messages.append({"role": "user", "content": REPHRASE_PROMPT})
+            else:
+                # Inject gap analysis prompt after each round with tool results
+                messages.append({"role": "user", "content": GAP_ANALYSIS_PROMPT})
+                if verbose:
+                    print(f"  [Round {round_id}] Injected gap analysis prompt")
+
+            # V10: Auto deep-read after specified round
+            if round_id == self.deep_read_after_round:
+                messages = self._run_deep_read(question, messages, verbose)
 
             # Check for stalemate
             if self._check_stalemate(messages):
