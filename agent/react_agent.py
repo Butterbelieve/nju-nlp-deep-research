@@ -8,6 +8,7 @@ to stay within the 40960-token context limit.
 """
 
 import json
+import re
 from typing import Any, Dict, List
 
 from .browsecomp_searcher import BrowseCompBM25Searcher
@@ -191,6 +192,47 @@ _MAX_SEARCH_RESULTS_IN_CONTEXT = 5
 _MAX_GETDOC_CHARS = 2000
 _AUTO_READ_TOP_N = 2  # auto-read top N docs after each search
 _AUTOREAD_DOC_CHARS = 1500  # truncate auto-read docs to this length
+
+
+def _extract_entities_from_results(messages: List[Dict[str, Any]]) -> List[str]:
+    """Extract key entities (capitalized phrases, dates, proper nouns) from recent tool results."""
+    entities: List[str] = []
+    seen: set = set()
+
+    for msg in reversed(messages):
+        if msg.get("role") != "tool":
+            continue
+        content = msg.get("content", "")
+        # Collect text from tool results
+        texts = []
+        try:
+            parsed = json.loads(content) if isinstance(content, str) else content
+            if isinstance(parsed, list):
+                for item in parsed[:3]:
+                    if isinstance(item, dict):
+                        texts.append(item.get("snippet", "")[:300])
+                        texts.append(item.get("text", "")[:300])
+            elif isinstance(parsed, dict):
+                texts.append(parsed.get("text", "")[:300])
+        except (json.JSONDecodeError, TypeError):
+            texts.append(content[:300])
+
+        for text in texts:
+            # Extract capitalized phrases (names, places, titles)
+            for match in re.findall(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b", text):
+                if match.lower() not in seen and len(match) > 4:
+                    entities.append(match)
+                    seen.add(match.lower())
+            # Extract quoted phrases
+            for match in re.findall(r'"([^"]{3,40})"', text):
+                if match.lower() not in seen:
+                    entities.append(f'"{match}"')
+                    seen.add(match.lower())
+
+        if len(entities) >= 8:
+            break
+
+    return entities[:8]
 
 
 def _truncate_tool_result(result: Any) -> Any:
@@ -482,6 +524,18 @@ class DeepResearchAgent:
                 if verbose:
                     print(f"  [Round {round_id}] Repeated query with no new results, injecting rephrase hint")
                 messages.append({"role": "user", "content": REPHRASE_PROMPT})
+            elif round_id < self.max_rounds and tool_calls:
+                # Inject discovered entities to guide next search round
+                entities = _extract_entities_from_results(messages)
+                if entities:
+                    hint = (
+                        "Key entities found in documents: "
+                        + ", ".join(entities[:6])
+                        + ". Try searching for these specific terms."
+                    )
+                    messages.append({"role": "user", "content": hint})
+                    if verbose:
+                        print(f"  [Round {round_id}] Discovered entities: {', '.join(entities[:6])}")
 
             # Check for stalemate
             if self._check_stalemate(messages):
