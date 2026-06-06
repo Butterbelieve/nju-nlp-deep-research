@@ -1,9 +1,10 @@
 """
-Deep Research Agent V10 — Auto Deep-Read + LLM Summarization.
+Deep Research Agent V12 — Multi-Query Pre-Search + Broader Retrieval.
 
-Round 1 forced search, Rounds 2-3 gap analysis, then auto deep-read
-top docs + LLM summary injected into context. Rounds 4+ continue
-with gap analysis. Forces answer on stalemate or max rounds.
+V10 deep-read + V12 improvements:
+1. Pre-search: LLM decomposes question into 3-4 diverse queries, search all, merge results
+2. Increased search scope (top_k=50) and deep-read top 8 docs
+3. Answer extraction aligned with eval.py
 """
 
 import json
@@ -67,6 +68,13 @@ DEEP_READ_SUMMARY_SYSTEM = (
     "You are analyzing documents to find information relevant to a question. "
     "Extract ONLY the specific facts, names, dates, numbers, and details that are "
     "directly relevant to answering the question. Ignore irrelevant content."
+)
+
+PRESEARCH_SYSTEM = (
+    "Decompose the question into 3-4 short BM25 search queries (2-4 words each). "
+    "Each query should target a different key entity, name, date, or specific clue. "
+    "Use the most distinctive and specific terms from the question. "
+    "Output each query on a separate line, nothing else."
 )
 
 
@@ -256,7 +264,7 @@ def execute_tool_call(
 
 
 class DeepResearchAgent:
-    """V10: Auto deep-read + LLM summarization after Round 3."""
+    """V12: Multi-query pre-search + broader retrieval + deeper read."""
 
     def __init__(
         self,
@@ -270,8 +278,9 @@ class DeepResearchAgent:
         max_recent_rounds: int = 3,
         temperature: float = 0.0,
         deep_read_after_round: int = 3,
-        deep_read_top_n: int = 5,
+        deep_read_top_n: int = 8,
         deep_read_doc_max_chars: int = 3000,
+        presearch_num_queries: int = 4,
     ) -> None:
         self.client = client
         self.searcher = searcher
@@ -283,6 +292,7 @@ class DeepResearchAgent:
         self.deep_read_after_round = deep_read_after_round
         self.deep_read_top_n = deep_read_top_n
         self.deep_read_doc_max_chars = deep_read_doc_max_chars
+        self.presearch_num_queries = presearch_num_queries
 
         tool_specs, tool_registry = get_agent_tool_specs_and_registry(
             searcher=searcher,
@@ -297,6 +307,62 @@ class DeepResearchAgent:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"Question: {question}"},
         ]
+
+    def _run_presearch(
+        self, question: str, verbose: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Multi-query pre-search: decompose question, search each, merge results."""
+        # Generate diverse search queries via LLM
+        try:
+            response = self.client.simple_chat(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": PRESEARCH_SYSTEM},
+                    {"role": "user", "content": question},
+                ],
+                temperature=0.0,
+                max_tokens=128,
+                extra_payload={"chat_template_kwargs": {"enable_thinking": False}},
+            )
+            raw = response["choices"][0]["message"].get("content", "")
+            queries = [q.strip() for q in raw.strip().splitlines() if q.strip()]
+            queries = queries[:self.presearch_num_queries]
+        except Exception as e:
+            if verbose:
+                print(f"  [Pre-Search] LLM decomposition failed: {e}")
+            # Fallback: use the question as single query
+            queries = [question[:60]]
+
+        if not queries:
+            queries = [question[:60]]
+
+        if verbose:
+            print(f"  [Pre-Search] Queries: {queries}")
+
+        # Execute each query and merge results by docid (keep highest score)
+        merged: dict[str, dict[str, Any]] = {}
+        for query in queries:
+            try:
+                results = self.tool_registry["search"](query=query)
+                if not isinstance(results, list):
+                    continue
+                for item in results:
+                    if not isinstance(item, dict):
+                        continue
+                    docid = item.get("docid", "")
+                    score = item.get("score", 0.0)
+                    if docid and (docid not in merged or score > merged[docid].get("score", 0.0)):
+                        merged[docid] = dict(item)
+            except Exception:
+                continue
+
+        # Sort by score descending
+        sorted_results = sorted(merged.values(), key=lambda x: x.get("score", 0.0), reverse=True)
+
+        if verbose:
+            print(f"  [Pre-Search] Merged {len(sorted_results)} unique docs from {len(queries)} queries")
+
+        return sorted_results
 
     def _check_stalemate(
         self,
@@ -474,11 +540,27 @@ class DeepResearchAgent:
         return messages
 
     def _extract_final_answer(self, content: str) -> str:
-        """Extract Exact Answer from model output, with format filtering."""
-        stripped = content.strip()
+        """Extract Exact Answer from model output, aligned with eval.py extraction."""
+        # Strip thinking tags first (aligned with eval.py)
+        cleaned = re.sub(r"<think\b[^>]*>.*?</think\s*>", "", content, flags=re.DOTALL).strip()
+        if not cleaned:
+            cleaned = content.strip()
+
+        # Try labeled answer patterns (aligned with eval.py: "Exact Answer", "Final Answer", "Answer")
+        for label in ("Exact Answer", "Final Answer", "Answer"):
+            match = re.search(
+                rf"{label}\s*:\s*(.+?)(?:\n(?:Confidence|Explanation|Reasoning|Notes?)\s*:|$)",
+                cleaned,
+                re.IGNORECASE | re.DOTALL,
+            )
+            if match:
+                answer = match.group(1).strip()
+                if answer and not answer.startswith('{"'):
+                    return answer
+
         # Filter out JSON-like garbage
-        if stripped.startswith('{"') or stripped.startswith('["'):
-            for line in content.split("\n"):
+        if cleaned.startswith('{"') or cleaned.startswith('["'):
+            for line in cleaned.split("\n"):
                 line = line.strip()
                 if not line or line.startswith("{") or line.startswith("["):
                     continue
@@ -486,17 +568,8 @@ class DeepResearchAgent:
                     return line
             return ""
 
-        # Try "Exact Answer: xxx" or "Answer: xxx"
-        for prefix in ("exact answer:", "answer:"):
-            for line in content.split("\n"):
-                line = line.strip()
-                if line.lower().startswith(prefix):
-                    answer = line[len(prefix):].strip()
-                    if answer and not answer.startswith('{"'):
-                        return answer
-
         # Try extracting from the last non-empty line
-        lines = [l.strip() for l in content.split("\n") if l.strip()]
+        lines = [l.strip() for l in cleaned.split("\n") if l.strip()]
         if lines and len(lines[-1]) < 100 and not lines[-1].startswith('{"'):
             answer = lines[-1]
             # Filter out "cannot be determined" type answers
@@ -507,11 +580,11 @@ class DeepResearchAgent:
                 return ""
             return answer
 
-        return content.strip()
+        return cleaned
 
     def run(self, question: str, verbose: bool = True) -> Dict[str, Any]:
         """
-        Run gap-driven ReAct loop.
+        Run multi-query pre-search + gap-driven ReAct loop.
 
         Returns
         -------
@@ -519,15 +592,28 @@ class DeepResearchAgent:
         """
         messages = self._build_initial_messages(question)
 
+        # V12: Pre-search phase — multi-query BM25 for broad recall
+        presearch_results = self._run_presearch(question, verbose)
+        if presearch_results:
+            # Inject pre-search results as context (truncated)
+            truncated = _truncate_tool_result(presearch_results)
+            # Format as a readable context message instead of raw JSON
+            context_parts = ["[Initial search results from multiple queries]:"]
+            for i, item in enumerate(truncated[:8], 1):
+                if isinstance(item, dict):
+                    docid = item.get("docid", "?")
+                    score = item.get("score", 0.0)
+                    snippet = item.get("snippet", "")[:300]
+                    context_parts.append(f"  [{i}] docid={docid} score={score:.2f}\n      {snippet}")
+            context_msg = "\n".join(context_parts)
+            messages.append({"role": "user", "content": context_msg})
+
         for round_id in range(1, self.max_rounds + 1):
             # Context management
             messages = manage_context(messages, self.max_recent_rounds)
 
-            # Only force search on round 1; later rounds use gap analysis
-            if round_id == 1:
-                tool_choice = "required"
-            else:
-                tool_choice = "auto"
+            # After pre-search, no need to force search on round 1
+            tool_choice = "auto"
 
             try:
                 response = self.client.simple_chat(
@@ -581,7 +667,6 @@ class DeepResearchAgent:
             if self._check_repeated_query_and_stale(messages):
                 if verbose:
                     print(f"  [Round {round_id}] Repeated query with no new results, injecting rephrase hint")
-                # Replace gap analysis with rephrase prompt (gap analysis not yet injected)
                 messages.append({"role": "user", "content": REPHRASE_PROMPT})
             else:
                 # Inject gap analysis prompt after each round with tool results
@@ -589,7 +674,7 @@ class DeepResearchAgent:
                 if verbose:
                     print(f"  [Round {round_id}] Injected gap analysis prompt")
 
-            # V10: Auto deep-read after specified round
+            # Auto deep-read after specified round
             if round_id == self.deep_read_after_round:
                 messages = self._run_deep_read(question, messages, verbose)
 
